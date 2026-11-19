@@ -28,18 +28,19 @@ HEADERS = {
 MAX_SEARCH_PAGES = 5
 SEARCH_PAGE_SIZE = 12
 MEDIA_KINDS = {"movie": "1", "series": "2"}
-SUBTITLE_CACHE_TTL = 6 * 60 * 60
+RESOLVE_CACHE_TTL = 6 * 60 * 60
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
 MAL_RE = re.compile(r"myanimelist\.net/anime/(\d+)")
-_subtitle_cache = {}
+_resolve_cache = {}
 
 MANIFEST = {
     "id": "org.cinemana.stremio",
-    "version": "1.1.0",
+    "version": "1.2.3",
     "name": "Cinemana",
     "description": "Direct MP4 streams and subtitles from Shabakaty's Cinemana",
     "logo": "https://cinemana.shabakaty.com/favicon.ico",
-    "resources": ["stream"],
+    "resources": ["stream", "subtitles"],
     "types": ["movie", "series"],
     "idPrefixes": ["tt"],
     "catalogs": [],
@@ -255,11 +256,24 @@ def cinemana_streams(video_id):
     return data if isinstance(data, list) else []
 
 
+def request_path_prefix():
+    """Keep an install/config path such as /abc123 in generated URLs."""
+    parts = request.path.strip("/").split("/")
+    if len(parts) >= 2 and parts[1] in ("stream", "subtitles", "subtitle-files"):
+        return f"/{parts[0]}"
+    return ""
+
+
 def addon_base_url():
+    if PUBLIC_URL:
+        return PUBLIC_URL
     proto = request.headers.get("X-Forwarded-Proto", request.scheme)
     host = request.headers.get("X-Forwarded-Host", request.host)
-    prefix = request.headers.get("X-Forwarded-Prefix", "").rstrip("/")
-    return f"{proto}://{host}{prefix}"
+    prefix = request.headers.get("X-Forwarded-Prefix", "")
+    proto = proto.split(",")[0].strip()
+    host = host.split(",")[0].strip()
+    prefix = prefix.split(",")[0].strip().rstrip("/")
+    return f"{proto}://{host}{prefix}{request_path_prefix()}"
 
 
 def subtitle_sources(info):
@@ -335,26 +349,105 @@ def ass_to_vtt(text):
     return "WEBVTT\n\n" + "\n\n".join(cues) + ("\n" if cues else "")
 
 
+def normalize_vtt_timestamp(value):
+    parts = value.strip().replace(",", ".").split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        return value.strip()
+
+    seconds, _, fraction = seconds.partition(".")
+    fraction = (fraction or "000")[:3].ljust(3, "0")
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}.{fraction}"
+
+
+def normalize_vtt(text):
+    """Rewrite cues as HH:MM:SS.mmm; Stremio's loader rejects MM:SS.mmm cues."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    if not text.lstrip().startswith("WEBVTT"):
+        text = "WEBVTT\n\n" + text.lstrip("\n")
+
+    def replace_timing(match):
+        return (
+            f"{normalize_vtt_timestamp(match.group(1))} --> "
+            f"{normalize_vtt_timestamp(match.group(2))}{match.group(3)}"
+        )
+
+    return re.sub(
+        r"(?m)^([\d:.,]+)\s*-->\s*([\d:.,]+)(.*)$", replace_timing, text
+    )
+
+
 def convert_to_vtt(text, extension):
     if extension == "vtt":
-        text = text.lstrip("\ufeff")
-        return text if text.lstrip().startswith("WEBVTT") else "WEBVTT\n\n" + text
+        return normalize_vtt(text)
     if extension in ("ass", "ssa"):
         return ass_to_vtt(text)
     return srt_to_vtt(text)
 
 
+def normalize_timing_line(line):
+    match = re.match(r"^([\d:.,]+)(\s*-->\s*)([\d:.,]+)(.*)$", line)
+    if not match:
+        return line
+    return (
+        f"{normalize_vtt_timestamp(match.group(1))}"
+        f"{match.group(2)}"
+        f"{normalize_vtt_timestamp(match.group(3))}"
+        f"{match.group(4)}"
+    )
+
+
+def proxy_subtitle(url, extension):
+    """Relay a subtitle from Cinemana without caching or storing it."""
+    if extension == "vtt":
+        upstream = requests.get(url, headers=HEADERS, timeout=30, stream=True)
+        upstream.raise_for_status()
+        upstream.encoding = "utf-8"
+
+        def generate():
+            try:
+                yield "WEBVTT\n\n"
+                header_done = False
+                for raw_line in upstream.iter_lines(decode_unicode=True):
+                    line = (raw_line or "").lstrip("\ufeff")
+                    if not header_done:
+                        if line.strip() == "":
+                            header_done = True
+                        continue
+                    if "-->" in line:
+                        line = normalize_timing_line(line)
+                    yield f"{line}\n"
+            finally:
+                upstream.close()
+
+        return Response(generate(), content_type="text/vtt; charset=utf-8")
+
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    text = response.content.decode("utf-8-sig", errors="replace")
+    return Response(
+        convert_to_vtt(text, extension),
+        content_type="text/vtt; charset=utf-8",
+    )
+
+
 def build_subtitle_tracks(video_id, info):
     base = addon_base_url()
     sources = subtitle_sources(info)
+    labels = {"ar": "Arabic (Cinemana)", "en": "English (Cinemana)"}
     tracks = []
     for language in ("ar", "en"):
         if language not in sources:
             continue
         tracks.append({
             "id": f"cinemana-{language}-{video_id}",
-            "url": f"{base}/subtitles/{video_id}/{language}.vtt",
+            "url": f"{base}/subtitle-files/{video_id}/{language}.vtt",
             "lang": language,
+            "label": labels[language],
         })
     return tracks
 
@@ -383,12 +476,39 @@ def build_streams(video_id, subtitles=None):
     return streams
 
 
+def episode_numbers(item):
+    """Return the episode numbers contained in a Cinemana video.
+
+    Some uploads bundle multiple episodes into one file; `episode_flag`
+    describes how the Cinemana site labels them.
+    """
+    try:
+        number = int(str(item.get("episodeNummer") or 0))
+    except ValueError:
+        return set()
+
+    flag = str(item.get("episode_flag") or "0000")
+    if flag == "0010":
+        return {number, number + 1}
+    if flag in ("0020", "0100"):
+        return {number, number + 1, number + 2}
+    if flag in ("0001", "1001"):
+        return {number - 1}
+    if flag == "1010":
+        return {number, number + 1}
+    return {number}
+
+
 def find_episode_id(series_id, season, episode):
+    try:
+        wanted = int(str(episode))
+    except ValueError:
+        return None
+
     for item in cinemana_episodes(series_id):
-        if (
-            str(item.get("season")) == season
-            and str(item.get("episodeNummer")) == episode
-        ):
+        if str(item.get("season")) != season:
+            continue
+        if wanted in episode_numbers(item):
             return item.get("nb")
     return None
 
@@ -443,34 +563,62 @@ def find_match(imdb_id, title, media_type, year=None):
     return None
 
 
-def get_streams(media_type, item_id):
+def resolve_video(media_type, item_id):
+    """Resolve a Stremio ID to a Cinemana video ID and its metadata."""
     if media_type not in MEDIA_KINDS:
-        return []
+        return None, None
 
     parts = item_id.split(":")
     imdb_id = parts[0]
 
     lookup = imdb_lookup(imdb_id)
     if not lookup:
-        return []
+        return None, None
     title, year = lookup
 
     info = find_match(imdb_id, title, media_type, year)
     if not info:
-        return []
+        return None, None
 
     if media_type == "movie":
-        subtitles = build_subtitle_tracks(info.get("nb"), info)
-        return build_streams(info.get("nb"), subtitles)
+        return info.get("nb"), info
 
     season = parts[1] if len(parts) > 1 else "1"
     episode = parts[2] if len(parts) > 2 else "1"
-    episode_id = find_episode_id(info.get("nb"), season, episode)
-    if not episode_id:
+    return find_episode_id(info.get("nb"), season, episode), info
+
+
+def resolve_video_id(media_type, item_id):
+    """Cache successful resolutions so the subtitle resource does not re-search."""
+    key = (media_type, item_id)
+    now = time.time()
+    cached = _resolve_cache.get(key)
+    if cached and now - cached[0] < RESOLVE_CACHE_TTL:
+        return cached[1]
+
+    video_id, _ = resolve_video(media_type, item_id)
+    if video_id:
+        _resolve_cache[key] = (now, video_id)
+    return video_id
+
+
+def get_streams(media_type, item_id):
+    video_id = resolve_video_id(media_type, item_id)
+    if not video_id:
         return []
-    episode_info = cinemana_info(episode_id) or {}
-    subtitles = build_subtitle_tracks(episode_id, episode_info)
-    return build_streams(episode_id, subtitles)
+
+    # Fetch the episode (or movie) metadata so subtitles are episode-specific.
+    info = cinemana_info(video_id) or {}
+    subtitles = build_subtitle_tracks(video_id, info)
+    return build_streams(video_id, subtitles)
+
+
+def get_subtitles(media_type, item_id):
+    video_id = resolve_video_id(media_type, item_id)
+    if not video_id:
+        return []
+    info = cinemana_info(video_id) or {}
+    return build_subtitle_tracks(video_id, info)
 
 
 @app.route("/manifest.json")
@@ -482,26 +630,31 @@ def manifest(config=None):
 @app.route("/stream/<media_type>/<item_id>.json")
 @app.route("/<config>/stream/<media_type>/<item_id>.json")
 def stream(media_type, item_id, config=None):
-    return jsonify({"streams": get_streams(media_type, item_id)})
+    response = jsonify({"streams": get_streams(media_type, item_id)})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
+@app.route("/subtitles/<media_type>/<item_id>.json")
+@app.route("/<config>/subtitles/<media_type>/<item_id>.json")
+def subtitles(media_type, item_id, config=None):
+    # Some clients send the episode/video ID as an extra argument.
+    item_id = request.args.get("videoID") or item_id
+    response = jsonify({"subtitles": get_subtitles(media_type, item_id)})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/subtitle-files/<video_id>/<lang>.vtt")
+@app.route("/<config>/subtitle-files/<video_id>/<lang>.vtt")
 @app.route("/subtitles/<video_id>/<lang>.vtt")
-def subtitle_file(video_id, lang):
+@app.route("/<config>/subtitles/<video_id>/<lang>.vtt")
+def subtitle_file(video_id, lang, config=None):
     lang = lang.lower()
     empty = Response("WEBVTT\n\n", content_type="text/vtt; charset=utf-8")
 
     if lang not in ("ar", "en"):
         return empty
-
-    key = (video_id, lang)
-    now = time.time()
-    cached = _subtitle_cache.get(key)
-    if cached and now - cached[0] < SUBTITLE_CACHE_TTL:
-        return Response(
-            cached[1],
-            content_type="text/vtt; charset=utf-8",
-            headers={"Cache-Control": f"max-age={SUBTITLE_CACHE_TTL}"},
-        )
 
     info = cinemana_info(video_id) or {}
     source = subtitle_sources(info).get(lang)
@@ -510,20 +663,9 @@ def subtitle_file(video_id, lang):
 
     _, url, extension = source
     try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        response.raise_for_status()
-        # Cinemana serves subtitles as text/plain without a charset.
-        text = response.content.decode("utf-8-sig", errors="replace")
-        text = convert_to_vtt(text, extension)
+        return proxy_subtitle(url, extension)
     except (requests.RequestException, ValueError):
         return empty
-
-    _subtitle_cache[key] = (now, text)
-    return Response(
-        text,
-        content_type="text/vtt; charset=utf-8",
-        headers={"Cache-Control": f"max-age={SUBTITLE_CACHE_TTL}"},
-    )
 
 
 if __name__ == "__main__":

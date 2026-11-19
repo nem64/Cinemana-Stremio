@@ -42,6 +42,26 @@ docker build -t cinemana-stremio .
 docker run --rm -p 5069:5069 cinemana-stremio
 ```
 
+## Subtitles
+
+Subtitles are relayed through the add-on as UTF-8 WebVTT at
+`/subtitle-files/<videoId>/<lang>.vtt` and normalized to `HH:MM:SS.mmm`
+timestamps (Stremio rejects Cinemana's `MM:SS.mmm` cues).
+
+The add-on only proxies the upstream subtitle on demand: it does not cache it,
+write it to disk, or store it anywhere.
+
+The add-on declares the `subtitles` resource and also attaches the same tracks to
+every stream. Arabic is included when Cinemana has it; English is included when
+Cinemana provides an English translation.
+
+If the add-on runs behind a reverse proxy and generated subtitle URLs use the
+wrong host or scheme, set the public base URL explicitly:
+
+```bash
+PUBLIC_URL=https://addon.example.com python addon.py
+```
+
 ## Install in Stremio
 
 1. Start the add-on.
